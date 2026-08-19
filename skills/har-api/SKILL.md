@@ -186,4 +186,4 @@ Macro costs: a second language to learn, opacity to rustfmt and rust-analyzer, i
 
 ## Documentation
 
-Every public item is documented. `# Panics` names the precondition that avoids it, `# Errors` names each failure, `# Examples` where use is not obvious — examples are doc tests, so they cannot rot, and they use `?` rather than `unwrap`. Do not restate the signature and do not describe how other code uses the item. Link with intra-doc links `[`Frame`]`; backtick anything that is source. Enforce with `#![warn(missing_docs)]` and `#![deny(broken_intra_doc_links)]`.
+Every public item is documented. `# Panics` names the precondition that avoids it, `# Errors` names each failure, `# Examples` where use is not obvious — examples are doc tests, so they cannot rot, and they use `?` rather than `unwrap`. Do not restate the signature and do not describe how other code uses the item. Link with intra-doc links `[`Frame`]`; backtick anything that is source. Enforce with `#![warn(missing_docs)]` and `#![deny(rustdoc::broken_intra_doc_links)]`.

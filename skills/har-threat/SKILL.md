@@ -81,7 +81,7 @@ fn bounded_text<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
 ```
 
 - Every wire string gets a length bound, every collection a count bound, every nested structure a depth bound. A missing bound is an attacker-chosen allocation.
-- `deny_unknown_fields` on every type deserialized from a peer. Silently ignored fields are how a version skew becomes a security hole.
+- `deny_unknown_fields` on every type deserialized from a peer, unless the wire format is versioned and must accept newer peers — then capture the remainder in one `HashMap<String, Value>` you bound and never act on. Silently ignored fields are how a version skew becomes a security hole; silently rejected ones are how forward compatibility dies.
 - `clap` carries the same bounds in the type: `#[arg(long, num_args = 5..=256)]` rejects before your code runs.
 - Never `as` on a wire value; `u32::try_from(x)?` (`har`).
 - Canonicalize a path from the wire, then check the prefix. Checking then canonicalizing is the traversal bug.

@@ -186,7 +186,7 @@ The executor is a thread pool with no preemption. Anything that blocks a worker 
 
 # Verification
 
-`loom` is the concurrency rung `har-verify` does not carry. It enumerates interleavings and weak-memory outcomes exhaustively, so it finds the ordering bug x86 hid:
+`loom` is `har-verify` rung 7, and this is how you use it. It enumerates interleavings and weak-memory outcomes exhaustively, so it finds the ordering bug x86 hid:
 
 ```toml
 [target.'cfg(loom)'.dependencies]
