@@ -1,6 +1,6 @@
 ---
 name: har-concurrent
-description: Rust shared-state concurrency — picking between channel, mutex, atomic and Once; memory ordering; Send/Sync; guard lifetime and spurious-wakeup traps; false sharing; async executor and cancellation rules. Load when threads share data, when writing anything with an Ordering argument, or when a lock meets .await.
+description: Rust shared-state concurrency — picking between channel, mutex, atomic and Once; memory ordering; Send/Sync; guard lifetime and spurious-wakeup traps; false sharing; building primitives. Load when threads share data or when writing anything with an Ordering argument.
 ---
 
 # Shared state
@@ -160,16 +160,9 @@ Refcount overflow is memory-unsafe, so it `abort()`s above `usize::MAX / 2` rath
 
 # Async
 
-The executor is a thread pool with no preemption. Anything that blocks a worker — `Mutex::lock` under contention, `join`, `park`, file I/O, a long CPU loop — stalls every other task on that worker, and stalls the whole program on a `current_thread` runtime.
+The executor is a thread pool with no preemption: anything that blocks a worker — a contended `Mutex`, `join`, `park`, file IO, a long CPU loop — stalls every other task on that worker. Two rules belong here because they are shared-state rules: `std::sync::Mutex` is the right default in async code (lock, mutate, drop the guard, never await while holding it — the guard is `!Send`, so the compiler says so), and a lock shared between a render thread and an async worker is the priority inversion above.
 
-- `Handle::block_on` panics inside a runtime thread; `futures::executor::block_on` does not panic, it deadlocks the worker instead. Never nest a runtime.
-- `spawn_blocking` for blocking **syscalls**: it moves the work to a separate, elastic pool. It is not for CPU-bound parallel work — use `rayon` (pool sized to cores) or one dedicated thread plus a channel. A `spawn_blocking` task cannot be interrupted once started.
-- **Cancel safety** is a per-future property: dropping the future loses no data. `mpsc::Receiver::recv` is cancel-safe; `AsyncReadExt::read_exact` and `write_all` are not — they can be dropped having consumed half a message. **Cancel correctness** is yours: after any drop your own state machine must still be valid.
-- `select!` drops every losing branch at whatever await point it reached. A future built inline in a branch is rebuilt each loop iteration, so partial progress vanishes silently. Build it once outside the loop and pin it, or only select over cancel-safe operations.
-- `try_join!` returns on the first error and drops the others mid-operation — same hazard, quieter.
-- `std::sync::Mutex` is the right default in async code: lock, mutate, drop the guard, all without awaiting. Its guard is `!Send`, so holding it across `.await` makes the future `!Send` and the error tells you. Reach for `tokio::sync::Mutex` only when the guard genuinely must be held across an await — and then a task that awaits something needing the same lock deadlocks with no diagnostic.
-- Dropping a `JoinHandle` detaches the task; it keeps running. `abort()` is cooperative: it takes effect at the next await point, never inside a synchronous block.
-- Bounded `mpsc::channel(n)` — `send().await` is the backpressure. `unbounded_channel` converts a slow consumer into unbounded memory growth.
+Everything else about async — runtime shape, task lifecycle, cancellation, shutdown, channels, subprocess stdio, framing, timeouts — is `har-async`.
 
 # Traps
 
