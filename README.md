@@ -1,4 +1,4 @@
-# har-skills
+# High Assurance Rust Skills
 
 Twelve skills that give AI coding agents high-assurance Rust guidance: what to write, what to refuse to write, and how to prove it.
 
