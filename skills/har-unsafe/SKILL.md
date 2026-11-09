@@ -19,6 +19,16 @@ Those five are not the whole of unsafe Rust. The Reference also treats as unsafe
 | `unsafe extern "C" { .. }` | 1.82 | edition 2024 (1.85) |
 | `#[unsafe(no_mangle)]`, `#[unsafe(export_name)]`, `#[unsafe(link_section)]` | 1.82 | edition 2024 (1.85) |
 | `slice::get_disjoint_mut`, `HashMap::get_disjoint_mut` | 1.86 | — |
+| `ptr::addr`, `with_addr`, `map_addr` (strict provenance) | 1.84 | — |
+| `<[T]>::as_chunks`, `as_chunks_mut`, `as_rchunks` | 1.88 | — (compile-time-checked indexing inside a chunk) |
+| `MaybeUninit` slice APIs: `assume_init_ref`/`_mut`/`_drop`, `write_copy_of_slice`, `write_clone_of_slice` | 1.93 | — |
+| `<[T]>::as_array`, `as_mut_array`, and the raw-pointer forms | 1.93 | — |
+| `String::into_raw_parts`, `Vec::into_raw_parts` | 1.93 | — |
+| `MaybeUninit<[T; N]>` ↔ `[MaybeUninit<T>; N]` conversions | 1.95 | — |
+| `<*const T>::as_ref_unchecked`, `<*mut T>::as_mut_unchecked` | 1.95 | — |
+| `Layout::dangling_ptr`, `repeat`, `repeat_packed`, `extend_packed` | 1.95 | — |
+| `Vec::into_parts`/`from_parts`, `Box::into_non_null`/`from_non_null` | 1.99 | — |
+| `size_of_val_raw`, `align_of_val_raw`, `Layout::for_value_raw` | 1.99 | — (size and align of a `?Sized` pointee without a reference) |
 
 Two lints change posture at edition 2024: `unsafe_op_in_unsafe_fn` **warns** by default — unsafe operations inside an `unsafe fn` still compile, but each one wants its own block and its own SAFETY note — while `static_mut_refs` is **deny** by default.
 
@@ -28,8 +38,8 @@ Two lints change posture at edition 2024: `unsafe_op_in_unsafe_fn` **warns** by 
 2. Load or store through a dangling or misaligned pointer.
 3. Place projection outside the allocation (field or index out of bounds).
 4. Aliasing violation — mutating behind a live `&T` outside `UnsafeCell`, or touching a live `&mut T`'s pointee through anything else. `Box<T>` counts as `&'static mut T`.
-5. Mutating immutable bytes — const-promoted temporaries, `static`/`const` initializers, data behind `&`.
-6. Invoking an intrinsic with invalid arguments.
+5. Mutating immutable bytes — const-promoted temporaries, `static`/`const` initializers, data behind `&`. A `const` item holding a mutable reference to a `static` has been accepted since 1.93 and the release notes describe it exactly as "*very* unsafe, but not *always* UB" — which is to say the compiler stopped refusing the shape and did not make it sound. `const_item_interior_mutations` (1.93) warns on the calls that mutate through one.
+6. Invoking an intrinsic with invalid arguments — including the `unchecked_*` arithmetic family (`unchecked_add`, and since 1.93 `unchecked_neg`, `unchecked_shl`, `unchecked_shr`), where overflow or an out-of-range shift is UB rather than a panic. They are `unsafe fn`s and the precondition is yours to prove; `checked_*` is the safe form (`har`).
 7. Executing code compiled for `target_feature`s the CPU lacks.
 8. Calling a function with the wrong ABI, or unwinding out of a non-unwinding ABI frame.
 9. Producing an invalid value, alone or as a field.
@@ -84,6 +94,7 @@ Privacy is the enforcement mechanism, so the unit of unsafety is the **module**:
 - `unsafe fn` means "has preconditions", not "contains unsafe ops" — each op inside still needs its own block, and edition 2024 warns when it does not.
 - A **safe** fn's SAFETY may cite only: type invariants of its arguments, checks it performed itself, values it constructed. Citing a caller promise means it must be an `unsafe fn`.
 - Enforce mechanically: `undocumented_unsafe_blocks`, `multiple_unsafe_ops_per_block`, `missing_safety_doc` = `"deny"` under `[lints.clippy]`; `unsafe_op_in_unsafe_fn` = `"deny"` and `static_mut_refs` = `"deny"` under `[lints.rust]`, before the edition forces them.
+- **Several rules this file states in prose are now lints.** Turn them on rather than reviewing for them: `integer_to_ptr_transmutes` (1.91) is exactly the provenance rule below; `dangling_pointers_from_locals` (1.91); `function_casts_as_integer` (1.93); `const_item_interior_mutations` (1.93); `raw_borrows_via_references` (1.99, allow-by-default, worth enabling); and `c_void_returns` (1.98) at an FFI boundary. Four are already deny-by-default and will find you on a toolchain bump instead of in review: `never_type_fallback_flowing_into_unsafe` and `dependency_on_unit_never_type_fallback` (1.92), `uninhabited_static` (1.96, now reported in **dependencies** too), and `invalid_runtime_symbol_definitions` (1.98, with `suspicious_runtime_symbol_definitions` beside it).
 
 ## Aliasing models: what is actually settled
 
@@ -119,7 +130,7 @@ let clean = tagged.map_addr(|a| a & !1);
 | `NonNull<T>` | — | **covariant** |
 | `fn(T) -> U` | — | **contravariant** in `T`, covariant in `U` |
 
-`&mut T` is invariant because it is a write channel: covariance would let you store a `&'short str` into a `&mut &'static str` and read it after the source dies. Diagnosis: "expected `Foo<'static>`, found `Foo<'a>`" with no visible cause is almost always an invariant position — an interior-mutability cell, a `&mut` field, a `PhantomData<*mut T>`. Variance is inferred structurally, so adding one `Cell<T>` field makes the struct invariant in `T` for every downstream user. That is an API break.
+`&mut T` is invariant because it is a write channel: covariance would let you store a `&'short str` into a `&mut &'static str` and read it after the source dies. One narrow relaxation since 1.98: shortening the lifetime of a `&mut` is permitted when it is part of an **unsize coercion**, even in an invariant position — `Cell<&'long mut i32>` to `Cell<&'short mut dyn Send>` now compiles. Read the table as the rule and that as the one exception, rather than reading the table as absolute. Diagnosis: "expected `Foo<'static>`, found `Foo<'a>`" with no visible cause is almost always an invariant position — an interior-mutability cell, a `&mut` field, a `PhantomData<*mut T>`. Variance is inferred structurally, so adding one `Cell<T>` field makes the struct invariant in `T` for every downstream user. That is an API break.
 
 **`NonNull<T>` is covariant, and that is a trap.** It looks like the owning-pointer type because it is non-null and carries the `Option` niche, but an owning or mutable container built on it inherits covariance and can be made unsound by shortening a lifetime and then writing. Add `PhantomData<Cell<T>>` or `PhantomData<&'a mut T>` where invariance is required, plus a separate ownership marker. `NonNull` is also `!Send` and `!Sync` by design — give the wrapper its own reasoned `unsafe impl`, never inherit silently.
 
@@ -148,6 +159,8 @@ Read the table in three columns at once — variance, auto traits, dropck — be
 `UnsafeCell<T>` is the **only** legal route from a `&` to a write, and that is all it is. It does not relax `&mut T`'s exclusivity, and it supplies **no synchronization** — two threads writing through one `UnsafeCell` is still a data race and still UB. Every abstraction built on it must state, in its SAFETY docs, what synchronizes the accesses and when a `&T` or `&mut T` to the payload may exist.
 
 Layout note that bites transmuters: `UnsafeCell<T>` has `T`'s layout but **suppresses niches**, so `Option<UnsafeCell<T>>` is not `Option<T>`'s size and any size or representation reasoning that assumes it is, is unsound.
+
+Since 1.99 the language guarantees that an `UnsafeCell`'s contents can be accessed **without going through `get()`** — a projection straight to the field is fine. That removes a dance, not an obligation: everything above about synchronization and about when a `&T` or `&mut T` to the payload may exist is unchanged.
 
 ### Pin, for the unsafe author
 

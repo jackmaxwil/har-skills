@@ -27,6 +27,8 @@ Rungs are ordered by cost, not by strength, and a higher one never supersedes a 
 
 Coverage is a side lane, not a rung, and never a release criterion. Concurrency (rung 7) is a second side lane: it answers a question no other rung asks.
 
+Two of those rungs cost a **dependency** and the rest cost only an installed subcommand, which is a much smaller decision: `proptest`, `bolero`, `insta`, `loom` and `shuttle` link into your crate and go through `har-supply`'s admission; `cargo-mutants`, `cargo-careful`, `cargo-fuzz`, `kani`, `miri` and `cargo-llvm-cov` are tools that never appear in your graph. Note that a dependency gate configured to exclude dev-dependencies will not see the first group at all, so that admission is a human one.
+
 ## Rung 1: tests against ground truth
 
 A round-trip test proves reversibility, not correctness — encrypt-then-decrypt passes on a backdoored cipher. Get external truth into `tests/`: spec vectors, RFC tables, recorded reference output.
@@ -36,6 +38,8 @@ Coverage is not state space: 100% line coverage still misses the input that trip
 **Snapshot tests** are the golden-oracle form of this rung, for output that is complex, externally visible and meant to be stable: serialized wire messages, rendered diagnostics, an AST dump. `insta` is the standard tool. Two rules make them evidence rather than a rubber stamp: every changed snapshot is reviewed by a human as part of the diff, and CI runs in a mode that will not write or accept a new snapshot on its own. They catch regressions; they assert nothing semantic, so they never replace a ground-truth or differential test.
 
 **`cargo-nextest`** is a better runner — process-per-test isolation, real parallelism, partitioning, machine-readable reports — and proves nothing extra. Adopt it for speed and failure isolation, and keep an explicit `cargo test --doc` gate, because nextest does not run doctests.
+
+`assert_matches!` and `debug_assert_matches!` (std, 1.96) assert a value matches a pattern and print the value when it does not — the assertion to reach for on an enum, where `assert_eq!` would force a `PartialEq` impl you do not otherwise want and a `matches!` inside `assert!` throws the value away on failure.
 
 ## Rung 1.5: coverage as diagnostics
 
@@ -78,6 +82,8 @@ cargo mutants --in-place --package parser
 ```
 
 It edits the code in small ways and asks whether any test notices. A surviving mutant means the oracle may not distinguish a realistic defect from correct behaviour — it is not itself a defect, and a kill-rate percentage is not a release gate. Expensive, so run it on the safety-critical modules and on changed code, not the whole workspace on every PR. Gate on **triage of every relevant survivor** — real gap, dead code, equivalent mutant, or timeout — and fix gaps by testing public behaviour, not by asserting against the specific mutation.
+
+**The cheapest mutant is one you write, and for a control it is the only one that works.** Where the thing under test is a *control* rather than a computation — a guardrail script, a permission check, a resource bound — the mutation is disabling the control and asserting the test fails for that control's own stated reason. That is `har-threat`'s "test the control, not the feature" made executable, and a generic mutation tool cannot do it because the control's logic is policy, not arithmetic. Build it into the gate as a `--selfcheck` flag that disables each check in turn and requires each to fail for its own reason, so the refute pass runs on every invocation instead of once by hand when the gate was written.
 
 ## Rung 4: sanitizers and cargo-careful
 
@@ -145,7 +151,7 @@ MIRIFLAGS="-Zmiri-many-seeds=0..64" cargo +nightly miri test
 MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test
 ```
 
-Detects out-of-bounds, use-after-free, misaligned access, uninitialized reads, data races, and aliasing violations — all of which need `unsafe` to introduce. Pointless on a `forbid(unsafe_code)` crate with no `unsafe` deps, valuable the moment either appears. 10-100x slow, so target a test subset: the safe wrappers around `unsafe`, the FFI adapters it can execute, and minimized fuzz and property regressions.
+Detects out-of-bounds, use-after-free, misaligned access, uninitialized reads, data races, and aliasing violations — all of which need `unsafe` to introduce. Pointless on a `forbid(unsafe_code)` crate with no `unsafe` *reachable* — and that second half is a question, not an assumption. Almost every real graph contains `unsafe`: a syscall wrapper, a TLS stack, a terminal emulator, a decoder. `cargo geiger` plus `cargo tree --invert` (`har-supply`) tell you whose, and whether your tests execute it. A RustSec **unsound** advisory against anything in your lockfile is this rung's exact bug class arriving pre-located, with the crate and the pattern already named — check for those before concluding the rung is not yours. 10-100x slow, so target a test subset: the safe wrappers around `unsafe`, the FFI adapters it can execute, and minimized fuzz and property regressions.
 
 **Miri is a path-sensitive UB detector, not a soundness verdict.** It observes the executions your tests perform; it has no networking and incomplete system and FFI support; its weak-memory emulation is incomplete; and its aliasing model is experimental (`har-unsafe` owns Stacked vs Tree Borrows). A clean run closes no unsafe review and discharges no proof obligation, and never disable its validation or borrow checking to make an assurance run pass. `-Zmiri-many-seeds` re-runs each test under many schedules, which is how interleaving bugs surface.
 
@@ -195,7 +201,11 @@ fn parse_never_panics() {
 }
 ```
 
+**The case nobody makes for Kani: proving a panic budget.** A crate that forbids `unsafe` has no UB for miri to find, which makes the ladder look like it stops at rung 5. But a no-panic policy enforced by linting on `unwrap`, `panic!`, `todo!` and friends is enforced on *spellings*, and the panics that matter do not spell themselves: `&s[..80]` landing mid-character, an `a + b` that overflows, a `chunks(0)`, a `Vec::remove` past the end, a `String::truncate` on a non-ASCII byte. Every one passes a spelling gate and panics at run time. Kani checks the behaviour, so one `#[kani::proof]` per function that slices, indexes or computes on an unvalidated value turns the policy into evidence inside the stated bound. That makes this the highest-value rung for precisely the codebase that believes it does not need rung 6.
+
 Proves no panic, overflow, or out-of-bounds access for **every** input inside the stated bound. It is bounded model checking, and the bound is part of the result: the proof is sound only when every loop-unwinding assertion passes at the recorded bound. Kani is **sequential** — it detects neither data races nor pointer-aliasing violations — and does not support inline assembly. Reserve it for parsers, arithmetic on untrusted values, and small self-contained `unsafe`, and make every result carry its harness preconditions, unwind bound, enabled checks, and the list of unsupported operations you had to review by hand. Concurrent algorithms get rung 7 or rung 9, not this.
+
+Beyond `#[kani::proof]` and `#[kani::unwind(n)]`, Kani takes **contracts**: `#[kani::requires]`, `#[kani::ensures]` and `#[kani::modifies]` on the function, verified through `#[kani::proof_for_contract(f)]`, plus loop contracts — `#[kani::loop_invariant]`, `#[kani::loop_modifies]`, `#[kani::loop_decreases]`. The loop contracts are the answer to the cost below: a loop invariant is how you stop paying an unwind bound for a loop whose bound is the thing you cannot state.
 
 Cost: loops need unwind bounds, state explosion limits input size, proofs need maintenance.
 

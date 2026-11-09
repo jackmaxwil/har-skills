@@ -15,6 +15,7 @@ A panic on a reachable path is a bug. Every source has a non-panicking form:
 | `map[&k]` (`Index` on `HashMap`/`BTreeMap`) | `map.get(&k).ok_or(Error::Missing)?` |
 | `&s[..n]` on a `str` — panics mid-character | `s.get(..n)`, or a char/grapheme boundary (`har-io`) |
 | `a + b`, `a - b`, `a * b` | `checked_*`, `saturating_*`, `wrapping_*` |
+| `a.strict_add(b)` and the rest of the `strict_*` family | they panic on overflow in **every** profile — that is their purpose; `checked_*` instead |
 | `a / b`, `a % b` — including `i32::MIN / -1`, which panics in **release** too | `checked_div`, `checked_rem`, or type the divisor `NonZeroU32` |
 | `a << b`, `a >> b` with `b >= bits` | `checked_shl`, `checked_shr`, or mask the shift |
 | `i32::MIN.abs()`, `.neg()` | `checked_abs`, `unsigned_abs` |
@@ -22,7 +23,7 @@ A panic on a reachable path is a bug. Every source has a non-panicking form:
 | `.unwrap()`, `.expect()` | `?`, `.ok_or(Error::Missing)?`, `unwrap_or_default()` |
 | `panic!`, `unreachable!`, `todo!` | return `Err` |
 | `dst.copy_from_slice(src)` | length check first, or `dst.iter_mut().zip(src)` |
-| `chunks(0)`, `windows(0)`, `step_by(0)` | validate the size into a `NonZeroUsize` |
+| `chunks(0)`, `windows(0)`, `step_by(0)` | validate the size into a `NonZeroUsize` — since 1.99 `unconditional_panic` catches the literal case, which is the easy half |
 | `RefCell::borrow_mut` | `try_borrow_mut()?`, or restructure to `&mut` |
 | `Vec::remove`, `Vec::insert`, `split_at`, `drain(bad_range)` | `get`-guarded index, `split_at_checked` |
 | `String::insert`, `String::remove` off a char boundary | operate on `char_indices`, or build a new `String` |
@@ -123,10 +124,13 @@ Typestate is for a small finite set of mandatory transitions. Optional configura
   - `checked_*` when overflow is an error: `a.checked_add(b).ok_or(Error::Overflow)?`
   - `saturating_*` when clamping is the spec
   - `wrapping_*` only when modular arithmetic *is* the spec (crypto, hashes, ring buffers)
+  - `strict_*` **never**, on a reachable path: it panics on overflow in every profile, which is a panic you chose
+  - where the wide result is what you actually want, `carrying_add` / `borrowing_sub` / `carrying_mul` and `checked_signed_diff` give it to you without an overflow to handle at all
 - `as` truncates and flips sign silently. Narrow with `u32::try_from(x)?`, widen with `From`/`Into`. Never `as` on a value that came from outside the process.
 - Overflow is defined in Rust (two's complement wrap), not UB — a wrong-answer bug, not corruption. Still a bug.
 - It stops being only a wrong answer the moment the wrapped value feeds a length, an index, or an offset: there it becomes a soundness problem.
-- `overflow-checks = true` under `[profile.release]` buys a loud failure for a small cost.
+- `overflow-checks = true` in the profile that actually ships buys a loud failure for a small cost — name that profile rather than assuming it is `release`, since a project with its own `dist` or `production` profile inherits from `release` and can silently not have it.
+- **Read that knob together with the panic strategy** (`har-layout`): with `panic = "abort"`, a surprise overflow is a process abort rather than a recoverable error. Under a zero-panic budget that makes the explicit `checked_*` the control and `overflow-checks` the backstop that proves you did not miss one — not an alternative to it.
 - Atomics are exempt from `overflow-checks` — `fetch_add` wraps in every profile (`har-concurrent`).
 - In a `const` context, overflow and out-of-bounds are **compile errors** rather than panics, so a const-evaluated expression and its runtime twin fail differently (`har-target`).
 

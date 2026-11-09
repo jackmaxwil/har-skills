@@ -66,11 +66,13 @@ Take `impl Fn(..)` or `F: Fn(..)`, never a bare `fn(..)` pointer — a pointer r
 | `PartialOrd` + `Ord` | both or neither | derived order is lexicographic by field, so field order is API |
 | `Hash` | derive when the type is a map key | if `Eq` is hand-written, `Hash` must be too: `x == y` ⇒ `hash(x) == hash(y)` |
 | `Default` | derive when a meaningful zero exists | never invent a default that is invalid |
-| `Display` | never derive; hand-write | only for end-user-facing types. `Debug` is for programmers |
+| `Display` | never derive; hand-write | only for end-user-facing types. `Debug` is for programmers. For a one-off rendering that does not deserve a type at all, `fmt::from_fn` (1.93) gives you a `Display` from a closure |
 
 House line: `#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]` on every id newtype, `#[derive(Debug, Clone, PartialEq)]` on every plain data struct.
 
 `#[must_use = "…"]` applies to functions **and to types**, and the reason string is where the caller learns what they dropped. Put it on anything whose discard loses the only evidence that work did not happen: a `close`/`commit` result, a guard, a validated token, a linear protocol state. Leave it off a deliberately fire-and-forget handle. Adding it to a shipped API is a new warning downstream, and downstream may run `-D warnings` — so decide at introduction.
+
+The compiler no longer nags about a `Result` that cannot fail: since 1.92 `unused_must_use` does not fire on `Result<(), !>` or `ControlFlow<!, ()>`, and since 1.97 a `Result<T, Uninhabited>` or `ControlFlow<Uninhabited, T>` is treated as `T` for the lint. So an infallible-by-type `Result` in a generic signature stays honest without forcing every caller to write `let _ =`.
 
 Three hard don'ts: never implement `Deref` for a non-pointer type; never overload an operator across unrelated types; never implement half an operator set — `Add` + `Neg` obliges `Sub`, and `x - y == x + (-y)` must hold.
 
@@ -170,6 +172,18 @@ Keep the explicit loop when the body is large or multi-purpose, when it returns 
 
 The rule is per crate, not per repo: a `lib` uses `thiserror` while the binary beside it uses `anyhow`.
 
+Both are dependencies, and a project that has declined the boxed-dyn-error one is not stuck. The binary then uses the same `thiserror` enum shape as its libraries, with one top-level variant per subsystem and `#[from]` on each:
+
+```rust
+#[derive(Debug, thiserror::Error)]
+enum Error {
+    #[error(transparent)] Config(#[from] config::Error),
+    #[error(transparent)] Store(#[from] store::Error),
+}
+```
+
+You lose `.context("…")` and gain a surface a test can match on. The cost is one variant per new failure source, which is the cost the libraries already pay — and a `main` that prints the `source()` chain (`har-layout`) reads about as well as a context trail.
+
 ```rust
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -201,11 +215,11 @@ Start narrow: private → `pub(super)` → `pub(crate)` → `pub(in path)` → `
 
 Visibility is only half of it. A `pub` struct with all-public fields commits every field and lets outsiders build it with literal syntax; a `pub` enum commits its variant set and every outside `match` is exhaustive over it. Adding `#[non_exhaustive]` **later** is itself a major break. So decide at introduction: data meant to grow gets private fields plus a constructor and accessors, or `#[non_exhaustive]` from version one, and the docs say which.
 
-Const generics make a value part of the type's identity — a fixed capacity, a protocol width. Stable const parameters are limited to integer types, `char` and `bool`, and generic const expressions remain restricted. Use one only when the value genuinely is type identity; runtime configuration otherwise. Never design a public API around an unstable const-generic capability.
+A const parameter is part of the public type's identity, so changing one is a major break and designing an API around an unstable const-generic capability commits you to nightly forever. `har-target` owns when a const parameter earns its place and what it costs.
 
 ### MSRV
 
-`[package] rust-version = "1.85"` is a support contract Cargo enforces, not a comment. Set it, state the policy for raising it, CI-test that exact toolchain across the supported feature sets, and treat a raise as a versioning and release-note event. "It compiles on the newest compiler" is not an MSRV claim. Resolver 3 is the edition-2024 default and prefers MSRV-compatible dependency versions, which reduces accidental raises but does not test the floor for you. (`har-supply` owns toolchain pinning and the CI shape.)
+`[package] rust-version = "1.99"` is a support contract Cargo enforces, not a comment. Set it, state the policy for raising it, CI-test that exact toolchain across the supported feature sets, and treat a raise as a versioning and release-note event. "It compiles on the newest compiler" is not an MSRV claim. Resolver 3 is the edition-2024 default and prefers MSRV-compatible dependency versions, which reduces accidental raises but does not test the floor for you. (`har-supply` owns toolchain pinning and the CI shape.)
 
 ### Breaking changes
 
@@ -228,7 +242,7 @@ Under Cargo's convention the left-most non-zero component is the incompatible on
 
 `cargo semver-checks` is evidence, not proof. Its checked feature set is configurable and its defaults skip feature names conventionally used for unstable or internal surfaces, and it cannot see inference, method-resolution, behavioral, layout or MSRV changes. So: define the supported feature matrix, run it with explicit baseline and current feature selections for each supported surface, compile a downstream fixture, and review by hand what a public-API diff cannot prove.
 
-Re-export any dependency whose types appear in your public API: `pub use rand;`. Without it a caller on another version gets trait-bound errors, because `RngCore` at two versions is two unrelated types.
+Re-export any dependency whose types appear in your public API: `pub use serde;`. Without it a caller on another version gets trait-bound errors, because `Serialize` at two versions is two unrelated traits and an impl against one does not satisfy the other.
 
 Features are additive and Cargo unifies them across the whole graph — never ship two features that are mutually incompatible, because nothing prevents both being enabled. Never feature-gate a public struct field or trait method; an outside constructor or implementor cannot know what to supply. Never `use somecrate::*` from a crate you do not control — a minor upgrade can add a colliding symbol or a trait method that shadows an inherent one. `use super::*` in a test module is fine.
 

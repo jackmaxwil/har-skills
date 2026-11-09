@@ -33,7 +33,7 @@ A trust boundary is any point where data or control crosses from a component you
 | paths on the wire | absolute paths in requests and diffs | traversal, and a symlink swapped between your check and your open |
 | a model or agent boundary | text produced by any of the above | data at the process boundary becomes instructions at the model boundary — see below |
 
-Write the boundary list into `ARCHITECTURE.md` next to the architecture it describes (`har-layout` owns that file). An undocumented boundary gets no owner and no review.
+Write the boundary list into the repo's architecture document, next to the architecture it describes (`har-layout` owns its shape and naming). An undocumented boundary gets no owner and no review.
 
 ## STRIDE
 
@@ -93,7 +93,8 @@ fn bounded_text<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
 ```
 
 - Every wire string gets a length bound, every collection a count bound, every nested structure a depth bound. A missing bound is an attacker-chosen allocation.
-- `clap` carries the same bounds in the type: `#[arg(long, num_args = 5..=256)]` rejects before your code runs.
+- Argument parsing carries the same bounds. A hand-rolled parser routes the raw string through the same checked constructor the wire path uses — `Count::new(n)?` — so the CLI and the wire share one validator instead of two that drift. A parser crate can express the bound declaratively instead (`clap`'s `#[arg(long, num_args = 5..=256)]` rejects before your code runs); either way the bound is stated once, in a type.
+- `{integer}::strict_*` is **not** a wire-value tool. It panics on overflow in every profile, so on peer input it is a remote denial of service — use `checked_*` and return the error (`har`).
 - Never `as` on a wire value; `u32::try_from(x)?` (`har`).
 - Data read back out of a local database is still peer data. Re-apply the bound at read, or store only already-validated newtypes.
 - Peer text rendered into a webview is script with your app's privileges. Set the text, never build HTML.
@@ -145,6 +146,12 @@ Availability is a security property. Every unbounded thing a peer can grow is a 
 
 ```rust
 const MAX_FRAME: u64 = 1 << 20;
+
+#[derive(Debug, thiserror::Error)]
+enum Error {
+    #[error("io")] Io(#[from] std::io::Error),
+    #[error("frame over {max} bytes")] FrameTooLong { max: u64 },
+}
 
 /// Reads one newline-terminated frame. An over-long frame is consumed and
 /// rejected, so the stream resynchronizes at the next newline rather than
@@ -211,7 +218,21 @@ Adversarial tests belong in the suite: subprocess output that asks for shell exe
 - Above that tier, memory residency is a **deployment** decision, not a crate: suppress core dumps and ptrace attachment (`PR_SET_DUMPABLE` on Linux), decide about locked memory and handle the failure explicitly, and account for swap, hibernation, crash reporters and backups. `secrecy` deliberately does not provide `mlock`/`mprotect`. Check these at startup and either fail closed or degrade loudly.
 - Secrets never enter error variants. `har`'s rule that a variant carries the offending value stops at secrets: carry the length and the bound, never the bytes. The error is printed, logged, and pasted into an issue.
 - Secrets never enter a log or span field (`har-layout` owns the redaction plumbing) and never enter argv or a child's environment — `ps` and `/proc` are readable by every process on the box. A sandbox edge is worth nothing if the value is passed through as an env var; hand it over a descriptor the child already holds.
-- Compare with `subtle::ConstantTimeEq`, never `==`. Early-exit comparison leaks the prefix length.
+- Never `==` on a secret, a MAC tag, or a token. `==` on slices short-circuits at the first differing byte, so the time it takes leaks how long a guessed prefix was correct — which turns forgery from 2^n work into 256n.
+
+  The shape that does not short-circuit is small enough to own, and the length is not secret:
+
+  ```rust
+  /// Compares two byte strings without an early exit on the first difference.
+  pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+      if a.len() != b.len() { return false; }
+      let mut diff = 0u8;
+      for (x, y) in a.iter().zip(b) { diff |= x ^ y; }
+      diff == 0
+  }
+  ```
+
+  **Be honest about what that buys.** Rust makes no language-level constant-time guarantee, nothing stops a future optimizer from reintroducing a branch, and `black_box` is a benchmarking barrier that must never be cited for a security property (`har-hot-path`). So this is the correct *shape* and a best-effort implementation: it removes the data-dependent early exit, which is the leak that is actually exploitable over a network. `subtle::ConstantTimeEq` is the reviewed version with the optimizer barriers done deliberately, and for a verification path that an attacker can call in a loop it is worth the dependency (`har-supply`). Either way, write the test that asserts the comparison agrees with `==` on equal, unequal, differing-length and empty inputs — a hand-rolled compare that is wrong is worse than a slow one.
 
 ```rust
 pub struct Token(String);
@@ -251,7 +272,7 @@ Nonce reuse under one key breaks the construction outright — WPA2 KRACK, the P
 
 GCM permits IV lengths other than 96 bits; 96 is the recommended form, not the only one, and the 2^32 bound is not specific to it. Read the table as: **random nonces mean a durable, global, per-key invocation counter and a rekey before exhaustion.** Deterministic counters remove the collision question and add a durable-state question instead. XChaCha's large nonce makes random generation comfortable and still requires uniqueness; choosing it defers the counting obligation rather than deleting it.
 
-Generate keys and nonces from an RNG bounded by `CryptoRng`, never merely `RngCore` — `RngCore` alone admits `SmallRng`, which is fast, reproducible, and predictable. In `rand` 0.9 `CryptoRng: RngCore`, so `R: CryptoRng` is the whole bound; on `rand` 0.8 write `R: RngCore + CryptoRng`. (`har-io` owns entropy availability on constrained targets.)
+Generate keys and nonces from an RNG the type system says is cryptographic, never one that merely implements the core trait — the core trait alone admits a small fast PRNG, which is reproducible and predictable. **The exact bound is version-specific and has changed twice**, so read the pinned version's own `CryptoRng` page and write it from that rather than carrying this line across an upgrade: in `rand` 0.10 `CryptoRng` is an alias for `Rng<Error = !> + TryCryptoRng`, so `R: CryptoRng` is the whole bound and `TryCryptoRng` is the fallible form; 0.9 had `CryptoRng: RngCore`; 0.8 needed `R: RngCore + CryptoRng`. (`har-io` owns entropy availability on constrained targets.)
 
 ### Key schedule
 
@@ -281,7 +302,7 @@ Three vulnerability classes sit outside every rung of `har-verify`: improper inp
 
 ## Boundary review checklist
 
-- Assets named, and the boundary drawn in `ARCHITECTURE.md` in prose someone else can read
+- Assets named, and the boundary drawn in the architecture document in prose someone else can read
 - Every input enumerated; each one bounded in length, count and depth **at its parser**, with the decoder's own options named
 - All six STRIDE letters walked, including the ones you dismissed and why
 - Failure posture stated: fail fast or degrade, and consistent across the component

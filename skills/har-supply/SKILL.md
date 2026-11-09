@@ -76,7 +76,9 @@ The same applies to the build scripts **you** write, and there the rules are abo
 
 ## Verify the artifact, not just the repository
 
-The `.crate` file Cargo downloads is not provably the repository you read. For new and updated dependencies that carry build scripts, proc macros, native code, or shipped binaries, reconcile the published artifact against its source: `cargo-witness` compares the downloaded crate to an attested commit where crates.io Trusted Publishing exists, and to package VCS metadata otherwise, flagging injected or modified `build.rs` and unexpected binaries. An unverifiable result means **manual review required**, not pass.
+The `.crate` file Cargo downloads is not provably the repository you read, and **this question has no mature tool.** Do not let a gate depend on one that is younger than the risk: the admission rules above — exact name, exact repo, pinned version — apply to your own tooling first.
+
+What you can do without one, for every new or updated dependency carrying a build script, a proc macro, native code or a shipped binary: unpack the `.crate`, read `.cargo_vcs_info.json` for the commit it claims, and diff the unpacked tree against that commit. Do it as part of the `cargo vet` delta audit, where you are already reading the diff, and record the verdict with the version. An unverifiable result means **manual review required**, not pass.
 
 Prefer versions published through Trusted Publishing, and publish your own crates that way — OIDC rather than a long-lived token — but treat provenance as a signal about *who published*, never as a code audit.
 
@@ -98,7 +100,11 @@ and in **every** member's manifest:
 workspace = true
 ```
 
-Workspace lints are not implicitly inherited — Cargo warns when a member omits the opt-in, so CI-check for it. `forbid` beats `deny`: it cannot be re-enabled by an inner `#[allow]` during a later refactor.
+Workspace lints are not implicitly inherited — Cargo warns when a member omits the opt-in, so CI-check for it.
+
+The other mechanism is a crate attribute, `#![forbid(unsafe_code)]` at the top of every `lib.rs` and `main.rs`. Both work, and the trade is where the failure mode sits: the workspace lint is one place and covers a new crate the moment it opts in, but a member that forgets `[lints] workspace = true` is silently unprotected; the attribute cannot be lost that way and is visible in the file a reviewer is already reading, at the cost of one line per crate and nothing stopping a new crate from omitting it. Pick one, and have CI assert the thing your choice cannot guarantee — the opt-in line, or the attribute's presence.
+
+Either way, `forbid` beats `deny`: it cannot be re-enabled by an inner `#[allow]` during a later refactor.
 
 This binds your crates only, never dependencies; Cargo caps lints for non-path dependencies. Roughly a fifth of public crates use `unsafe`, and unsound `unsafe` produces exactly the memory errors Rust otherwise eliminates. To see it:
 
@@ -108,7 +114,7 @@ cargo geiger                      # unsafe counts per crate in the graph
 cargo tree -f "{p} {f}"           # feature flags that may enable unsafe paths
 ```
 
-`cargo-geiger` is maintained and is a **triage metric, not a verdict** — its own docs say so. It counts explicit `unsafe` and can say nothing about safe-looking code, build scripts, proc macros, generated or native code, or a malicious upstream change. Diff the counts and locations across an upgrade and review what moved. Neither a zero count nor a `forbid(unsafe_code)` badge is an admission criterion; `cargo vet` and the sandbox are.
+`cargo-geiger` is a **triage metric, not a verdict** — its own docs say so: it exists "to provide statistical input to auditing" and "is not meant to advise directly whether the code ultimately is truly insecure or not". It counts explicit `unsafe` and can say nothing about safe-looking code, build scripts, proc macros, generated or native code, or a malicious upstream change. Diff the counts and locations across an upgrade and review what moved. Neither a zero count nor a `forbid(unsafe_code)` badge is an admission criterion; `cargo vet` and the sandbox are.
 
 Vet reachable unsafe first — `unsafe` in a code path you never call is lower risk than `unsafe` under your hot loop. Safe abstractions over `unsafe` internals are legitimate; unchecked `unsafe` in your own call graph is not.
 
@@ -189,6 +195,8 @@ A bare `cargo install cargo-deny` resolves whatever release exists that day, so 
 - Choose the resolver explicitly at the workspace root. Edition 2024 implies resolver 3 (1.84+), whose `resolver.incompatible-rust-versions = "fallback"` is a *preference* for MSRV-compatible versions — a dependency's own requirements can still force a newer release. Resolve and update with the MSRV toolchain in CI so that is visible.
 
 ### Edition migration is a semantic review
+
+Edition 2024 is still the current edition, so for most codebases this section is reference material rather than pending work — read it when you adopt 2024, or when the next edition lands.
 
 `cargo fix --edition` is the mechanical half. Run the compatibility lint group, then **read** every rewrite it made, because edition 2024 changed behaviour in four places that are exactly where a high-assurance codebase lives:
 

@@ -7,7 +7,7 @@ description: Rust project shape — flat workspaces, when a crate split pays, AR
 
 ## Layout
 
-- Virtual manifest at the root. Every crate exactly one level deep under `crates/`. **Directory name equals crate name.** This holds from ten thousand to a million lines.
+- Virtual manifest at the root. Every crate exactly one level deep under `crates/`. **Directory name equals crate name, or differs from it only by one project-wide prefix** — `crates/types` holding `yi_types` is fine and keeps every path short; `crates/frame/store` holding `frame_store` is the thing to avoid. This holds from ten thousand to a million lines.
 - Keep the common prefix in the folder name — `frame_store`, `frame_paint` — rather than nesting `frame/store`. Hierarchy rots; flat does not.
 - `version = "0.0.0"` for internal crates that will never be published. Crates with real semver live in `libs/`, and `libs/` must not depend on `crates/`.
 - Never flatten `src/` away, even for a one-file crate.
@@ -29,9 +29,9 @@ A module is free. A crate costs a manifest, a version, a link step, and a public
 
 Shape the graph **wide, not deep**: independent branches compile in parallel, a chain serializes. Derive-heavy and `serde`-heavy code belongs at the leaves nearest the system boundary so intermediate crates never pay proc-macro cost.
 
-## ARCHITECTURE.md
+## The architecture document
 
-One file at the root, for the reader who has never opened the repo:
+One durable document, named in the repo's own contributing guide — `ARCHITECTURE.md` at the root is the common spelling, `docs/ARCHITECTURE.md` or a numbered design doc serve the same purpose. What matters is that there is exactly one and that a newcomer is pointed at it. For the reader who has never opened the repo:
 
 - A bird's-eye statement of the problem.
 - A **codemap**: coarse module or crate to responsibility, one line each.
@@ -97,7 +97,10 @@ tests/
     gate.rs
 ```
 
-Measured on rust-analyzer: 3x faster test compile, 5x smaller artifacts, run time 20s to 13s.
+Two things change that trade, and both are common:
+
+- **A runner with process-per-test isolation** (`cargo-nextest`, `har-verify` rung 1) removes the sequential-execution half of the cost, leaving only link time. Measure the link cost before consolidating — `cargo test --no-run` as its own CI step is how you see which half is slow.
+- **A project that routes tests into lanes by attribute** — `#[ignore]` plus a reason string a script checks, so an expensive or paid test cannot land in the lane a push runs — needs tests findable by file and name. One binary makes that harder, and the lane discipline is worth more than the link time.
 
 - Route cases through one helper — `fn check(input: &str, expect: &str)` — so a signature change touches one function.
 - Externalize cases into data files under `tests/data/`; adding a case then adds no code.
@@ -130,6 +133,22 @@ Install a panic hook early in `main`, before anything can panic, and decide thes
 `catch_unwind` is a containment boundary at a specific place — a plugin call, a request handler, an FFI export — not a general error mechanism. After catching, discard or restore the state the unwind passed through, and remember `AssertUnwindSafe` is a claim rather than a check.
 
 ## Observability
+
+Every row below names a crate, so start with what you get without one. A level enum, one `write!` to a locked `stderr` behind an env check, and the stdout/stderr split further down cover "what happened" for a single-threaded tool completely:
+
+```rust
+// No dependency. Enough for lifecycle lines and errors a human reads.
+pub fn log(level: Level, args: fmt::Arguments<'_>) {
+    if level <= max_level() {                       // read once from the env, cached in a OnceLock
+        let mut err = std::io::stderr().lock();
+        let _ = writeln!(err, "{level} {args}");    // diagnostics never touch stdout
+    }
+}
+```
+
+**Spans are the thing with no dependency-free equivalent.** Durations and nesting you can hand-roll badly; re-associating interleaved lines from concurrent tasks is what a span id buys, and hand-rolling that is building `tracing` worse. So the decision is binary and worth making deliberately: either the causality is worth a dependency, or the design should not need it — one worker per task with its own prefix, or a counter instead of a trace. Do not land half of it.
+
+Once a crate is admitted (`har-supply` owns that):
 
 | Want | Use |
 | --- | --- |
@@ -237,16 +256,18 @@ pub fn load<P: AsRef<Path>>(path: P) -> Result<Config, Error> {
 
 Take `&str` and `&Path` in application code; `impl AsRef<str>` exists to buy ergonomics across a published boundary, and costs a monomorphized copy per caller type everywhere else. Prefer `&dyn Trait` at a crate boundary where each downstream crate would otherwise monomorphize its own copy.
 
-CI: `CARGO_INCREMENTAL=0`, `RUSTFLAGS=-D warnings` — never `#![deny(warnings)]` in source, which breaks the build on every new compiler. `[profile.dev] debug = 0` or `split-debuginfo = "unpacked"` on macOS, and `[profile.dev.build-override] opt-level = 3` so proc macros are optimized even in dev builds.
+**Lints worth turning on deliberately**, because the default level is not the right one for a workspace of binaries: `dead_code_pub_in_binary` (1.97, allow-by-default) finds `pub` items nothing reaches — in a workspace that publishes nothing, `pub` means "visible to the next crate up", so this is the compiler doing a reachability audit you would otherwise write by hand. `unused_visibilities` (1.94) catches visibility on `const _`. `unreachable_cfg_select_predicates` joined the `unused` group in 1.99, so it bites the moment you adopt `cfg_select!`.
+
+CI: `CARGO_INCREMENTAL=0`, `RUSTFLAGS=-D warnings` — never `#![deny(warnings)]` in source, which breaks the build on every new compiler. Note that `-D warnings` means a compiler upgrade can fail the build on a lint that did not exist before, which is why a toolchain bump is its own commit with its own full run (`har-supply`). `[profile.dev] debug = 0` or `split-debuginfo = "unpacked"` on macOS, and `[profile.dev.build-override] opt-level = 3` so proc macros are optimized even in dev builds.
 
 ## Anti-patterns
 
 | Anti-pattern | Fix |
 | --- | --- |
 | Deep crate chain "for organization" | flat `crates/`, wide graph, modules inside crates |
-| Nested dirs whose names differ from the crate names | one level deep, directory name equals crate name |
+| Nested dirs (`crates/frame/store`) | one level deep; the dir name is the crate name, give or take one project-wide prefix |
 | `serde`/derive in a core crate everything depends on | push it to a leaf at the boundary |
-| `tests/a.rs`, `tests/b.rs`, `tests/c.rs` | `tests/it/main.rs` with modules |
+| `tests/a.rs`, `tests/b.rs`, `tests/c.rs` with no lane discipline and a slow link | `tests/it/main.rs` with modules — unless a per-test runner or an attribute-routed lane wants them separate |
 | `util`/`helpers`/`common` module | name what it owns, or fold it into the one caller |
 | Trait with one implementation | delete the trait, use the concrete type |
 | `bool` + `Option<T>` describing one thing | one enum with data in the variants |

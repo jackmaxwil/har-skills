@@ -35,6 +35,7 @@ A `spawn_blocking` task cannot be aborted once it has started, so bound it by it
 - `new_multi_thread`: workers default to core count, `max_blocking_threads` to 512, each worker's local queue holds 256 tasks, and the LIFO slot holding the last-woken task is not stealable, so a long poll parks whatever sits behind it. `new_current_thread` runs only inside `block_on`; once it returns, its spawned tasks freeze.
 - **`tokio::spawn` demands `Send + 'static` on a current-thread runtime too.** The single thread does not relax the API bound. `!Send` state (a UI handle, an `Rc`) may exist only *between* awaits inside a spawned future; state that must live across one needs `LocalSet` + `spawn_local` or `LocalRuntime`, and locally spawned tasks do not run until the `LocalSet` is polled.
 - To bridge sync → async, put the runtime on its own `std::thread` driven by a bounded channel; `Handle::block_on` submits to an existing runtime, it does not drive one.
+- **On a single-threaded runtime none of the multi-thread tuning above applies, and `block_in_place` panics unconditionally.** That is the case for a UI toolkit's executor, for `new_current_thread`, and for any build that omits tokio's `rt-multi-thread` feature. A call that can only ever panic is not a trade-off to weigh at review time: put it in the project's `disallowed-methods` list (`har-supply`) and let the lint carry it. Note also that without the `fs` feature there is no `tokio::fs`, which makes the `std::fs`-in-async trap below a non-issue by construction rather than by discipline.
 
 ## Task lifecycle
 
@@ -173,12 +174,13 @@ When the peer's stdio is bridged over a socket, a vsock, a VM boundary or an RPC
 | Header block then body (`Content-Length:`, LSP style) | hand-rolled `Decoder` — nothing built-in covers it |
 | Pure proxying | `BytesCodec`, or `copy_bidirectional` and no codec |
 | A real format (protobuf, CBOR) | length-delimited frame plus your parser; do not merge the two |
+| **No codec crate admitted** | `Read::take(max)` plus `BufRead::read_until(b'\n', ..)`, in a loop that owns the reader — `har-threat`'s resource-bounds section writes the whole function, including the bounded resynchronize the naive version gets wrong and the reason it reads bytes rather than a `String` |
 
 **Always construct the bounded form.** `LinesCodec::new()` puts no upper bound on a line, which on a peer-fed stream is an unbounded allocation; `new_with_max_length` resynchronizes instead, discarding up to the limit until the next newline. `max_frame_length` is the same knob for length-delimited frames. `har-threat` owns why a peer will make you regret the missing bound. `Framed` is both `Stream` and `Sink`, so one `&mut` does one at a time. For a duplex protocol use `StreamExt::split()` (or `tokio::io::split`) and give each half its own task, joined by channels. `SinkExt::send` inside a `select!` cannot corrupt the wire but does lose the message; a dedicated writer task fed by a channel makes the question disappear.
 
 # Streams
 
-`Stream` is the async `Iterator`. **As of 2026-09-11 it is still not in std**: `core::async_iter::AsyncIterator` is nightly-only behind `feature(async_iterator)`, tracking issue rust-lang/rust#79024. The trait you use is `futures_core::Stream`, re-exported by `futures` and `tokio-stream`.
+`Stream` is the async `Iterator`. **It is still not in std**: `core::async_iter::AsyncIterator` is nightly-only behind `feature(async_iterator)`, and its tracking issue — rust-lang/rust#79024 — is open with the implementation, documentation and stabilization steps all unchecked. The trait you use is `futures_core::Stream`, re-exported by `futures` and `tokio-stream`.
 
 ```rust
 async fn pump(io: impl AsyncRead + Unpin, out: mpsc::Sender<Frame>) -> Result<(), Error> {

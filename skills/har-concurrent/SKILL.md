@@ -81,6 +81,8 @@ if let Some(item) = list.lock()?.pop() { process(item); }
 
 Both forms still differ, but **the exact drop point is edition-dependent and per-construct**, so do not carry a single mnemonic across all three. In edition 2024 an `if let` scrutinee temporary is dropped **before** the `else` block, where in earlier editions it lived to the end of the statement; `match` keeps the older statement-wide behaviour; `while let`'s scrutinee temporary is scoped to the condition and body. Read the Reference's destructors chapter for the construct you are using — and where the unlock point matters for correctness, bind the guard to a `let` or wrap it in an inner block instead of relying on any of this.
 
+`RwLockWriteGuard::downgrade` (1.92) turns a write guard into a read guard **without releasing the lock**, so a read-modify-then-serve path does not have to drop and re-acquire — which is where a writer loses the lock to a reader it was about to serve.
+
 Minimize the locked region, not the lock count. `drop(guard)` explicitly before slow work. One lock, or a strict global lock order. `std` has no deadlock detection. Never share a lock between a latency-critical thread and a background worker: `std` has no priority-inheritance mutex, so that is a priority inversion and a dropped frame. Hand data over instead. Priority inheritance, where a real-time deployment needs it, is an OS and lock-implementation policy — Rust's atomics supply none of it.
 
 ## Condvar and park
@@ -103,16 +105,7 @@ Minimize the locked region, not the lock count. `drop(guard)` explicitly before 
 
 ## Availability
 
-Atomic width is target-conditional. `std` guarantees that an atomic type which **exists** on the target is lock-free — not wait-free, and not present everywhere. There is no promised lock-based fallback. So a portable algorithm gates on capability and ships a lock-based design for targets that lack the width:
-
-```rust
-#[cfg(target_has_atomic = "64")]
-mod fast;
-#[cfg(not(target_has_atomic = "64"))]
-mod locked;
-```
-
-`target_has_atomic` takes `8`, `16`, `32`, `64`, `128`, and `ptr`. Anything reaching for `AtomicU128` or pointer-width atomics states the gate explicitly.
+`std` guarantees that an atomic type which **exists** on the target is lock-free — not wait-free, and not present everywhere, with no promised lock-based fallback. So anything reaching for `AtomicU64` on a small target, for `AtomicU128`, or for pointer-width atomics gates on capability and ships the alternative. `har-target` owns `target_has_atomic`, its accepted widths, and the shipped fallback.
 
 ## The operations
 
@@ -124,7 +117,13 @@ NEXT_ID.fetch_update(Relaxed, Relaxed, |n| n.checked_add(1)).map_err(|_| Error::
 
 ## The CAS loop
 
-`compare_exchange_weak` inside a loop, `compare_exchange` outside one. Failure ordering may be weaker than success and is `Relaxed` whenever the failure branch touches nothing shared.
+**Reach for `update` or `fetch_update` first.** `update` / `try_update` exist on every atomic type since 1.95 (`AtomicBool`, `AtomicPtr` and the integers), and `fetch_update` predates them: they take the two orderings and a closure and run the retry loop for you, which is the loop everyone writes slightly wrong.
+
+```rust
+NEXT_ID.fetch_update(Release, Relaxed, |n| n.checked_add(1)).map_err(|_| Error::IdSpace)?
+```
+
+Write the loop by hand only when the retry needs to do something the closure cannot — bail out, await, or touch another variable. Then: `compare_exchange_weak` inside a loop, `compare_exchange` outside one. Failure ordering may be weaker than success and is `Relaxed` whenever the failure branch touches nothing shared.
 
 ```rust
 let mut current = a.load(Relaxed);
@@ -177,7 +176,7 @@ Illegal combinations panic at **runtime**, not compile time. There is no acquire
 - **Lifetime and reclamation** — see below. An `Acquire` load tells you nothing about whether the old allocation is still alive.
 - **ABA** — a CAS succeeds across A→B→A. Matters for pointers and for reused indices; add a generation counter.
 - **Alignment** — `AtomicPtr::from_ptr` requires the `AtomicPtr`'s own alignment, and availability is gated on `target_has_atomic = "ptr"`.
-- **Provenance** — use `AtomicPtr`, never an integer atomic holding an address. For pointer tagging use the `map_addr`-family APIs, which preserve provenance; masking through `usize` loses it (`har-unsafe` owns the provenance model).
+- **Provenance** — use `AtomicPtr`, never an integer atomic holding an address. `AtomicPtr` has had the arithmetic and bit operations since 1.91 — `fetch_ptr_add` / `fetch_ptr_sub` in units of `T`, `fetch_byte_add` / `fetch_byte_sub` in bytes, and `fetch_or` / `fetch_and` / `fetch_xor` for tag bits — so a tagged pointer no longer needs a load-modify-CAS loop and no longer needs to leave the pointer type. Outside an atomic, the `map_addr` family is the provenance-preserving form; masking through `usize` loses it either way (`har-unsafe` owns the provenance model).
 
 **Reclamation is mandatory, not optional.** Swapping an `Arc<T>` or a raw pointer wholesale publishes the new value but does not tell you when the last reader of the old one is finished. Pick a mechanism and write it down: reference counting (`arc-swap`), hazard pointers, epoch-based reclamation (`crossbeam-epoch`), or quiescent-state tracking. EBR has its own contract — pin before loading a protected pointer, keep guards short, never carry a guard-derived reference across a `repin` or an unpinned gap, and expect deferred destruction to stall for as long as any participant stays pinned.
 
@@ -189,12 +188,18 @@ Coherence is MESI: any write claims a cache line exclusively and invalidates eve
 
 Do not hardcode a line size. There is no portable one, and the effective granule is not always the nominal line: `crossbeam_utils::CachePadded` deliberately assumes **128 bytes on x86-64 and aarch64** — 128 on x86-64 to cover Intel's adjacent-line prefetch despite nominal 64-byte lines — 256 on s390x, 32 on arm/mips/sparc/hexagon, 16 on m68k, and 64 elsewhere, and its own docs call these reasonable guesses rather than hardware facts. Apple documents `sysctl hw.cachelinesize` as the way to ask.
 
-So: wrap hot per-thread cells in `crossbeam_utils::CachePadded` for portable separation, and hardcode an alignment only for a named target you measured.
+So: align hot per-thread cells deliberately, and say which target the number came from.
 
 ```rust
-use crossbeam_utils::CachePadded;
-struct Counters(Box<[CachePadded<AtomicU64>]>);
+// 128 rather than 64: on x86-64 the adjacent-line prefetcher pulls the
+// neighbour, so a nominal 64-byte line is not the effective granule.
+#[repr(align(128))]
+struct Counter(AtomicU64);
+
+struct Counters(Box<[Counter]>);
 ```
+
+That needs no dependency and is honest about being one target's number. `crossbeam_utils::CachePadded` is the portable form of the same idea, carrying a per-architecture table its own docs call reasonable guesses rather than hardware facts — worth a dependency when you ship to architectures you have not measured, and not otherwise (`har-supply`).
 
 **x86-64 hides ordering bugs.** For ordinary loads and stores, relaxed/acquire/release compile to the same instructions as non-atomic ones there; only a `SeqCst` store or fence costs extra. Read-modify-writes are a different matter on every target — they lower to `lock`-prefixed instructions or an LL/SC loop, never to a plain load-operate-store. On aarch64 `Relaxed` is genuinely cheaper (`ldr`/`str` vs `ldar`/`stlr`) and pre-v8.1 RMWs are LL/SC loops, so `compare_exchange_weak` pays where on x86-64 it lowers the same as the strong form. A relaxed-where-acquire-was-needed bug can be perfect on x86 and wrong on an M1. CI runs aarch64, or `loom`. Every one of these statements is a codegen observation for a particular compiler and target — check the assembly, do not treat it as a source-level contract.
 
@@ -242,15 +247,8 @@ Everything else about async — runtime shape, task lifecycle, cancellation, shu
 
 # Verification
 
-`loom` is `har-verify` rung 7, and this is how you use it. It enumerates interleavings and permitted orderings for code written against **loom's own** primitives, so it finds the ordering bug x86 hid:
+`har-verify` rung 7 owns the setup, the cost model and what a green run does and does not prove. Three facts belong here because they are about ordering rather than about tooling:
 
-```toml
-[target.'cfg(loom)'.dependencies]
-loom = "0.7"
-```
-
-```
-RUSTFLAGS="--cfg loom" cargo test --release --test loom
-```
-
-Swap `std::sync::atomic` and `std::thread` for `loom::sync::atomic` and `loom::thread` under `cfg(loom)`, wrap the scenario in `loom::model(|| ...)`, and keep it to 2-3 threads and a handful of operations — cost is exponential. Loom does not implement the full C11 model: it treats `SeqCst` as `AcqRel` and does not explore some load-buffering outcomes, so a green run is strong bounded evidence about modelled primitives, not a proof about production code. `shuttle` scales further with randomized schedules; `har-verify` places both. Then `MIRIFLAGS="-Zmiri-many-seeds=0..64" cargo +nightly miri test` to re-run under many randomized schedules. None of them replaces an aarch64 job in CI.
+- Loom finds exactly the bug x86-64 hides, because it explores the orderings the hardware happens not to exhibit — which is why "it passes on my machine" is not evidence for an `Ordering` argument.
+- Loom treats `SeqCst` as `AcqRel` and skips some load-buffering outcomes, so it cannot vindicate a `SeqCst` you could not justify in the first place.
+- Neither loom nor miri replaces **an aarch64 job in CI**. That is the cheapest of the three and the one most often missing.
